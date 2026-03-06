@@ -1,0 +1,257 @@
+#include "catlass/arch/arch.hpp"
+#include "catlass/arch/cross_core_sync.hpp"
+#include "catlass/arch/resource.hpp"
+#include "catlass/catlass.hpp"
+#include "catlass/debug.hpp"
+#include "catlass/epilogue/block/block_epilogue.hpp"
+#include "catlass/epilogue/dispatch_policy.hpp"
+#include "catlass/gemm/block/block_mmad.hpp"
+#include "catlass/gemm/block/block_swizzle.hpp"
+#include "catlass/gemm/block/block_scheduler_gdn_fwd_h.hpp"
+#include "catlass/gemm/dispatch_policy.hpp"
+#include "catlass/gemm/gemm_type.hpp"
+#include "catlass/layout/layout.hpp"
+#include "catlass/gemm_coord.hpp"
+
+#include "kernel_operator.h"
+using namespace Catlass;
+
+namespace Catlass::Gemm::Kernel {
+
+template<
+    class CubeScheduler, 
+    class VecScheduler, 
+    class BlockMmadWH,
+    class BlockMmadKV,
+    class EpilogueGDNFwdHVnew,
+    class EpilogueGDNFwdHUpdate
+>
+class GDNFwdHKernel {
+public:
+    
+    using ArchTag = Arch::AtlasA2;
+
+    using GDNFwdHOffsets = Catlass::Gemm::Block::GDNFwdHOffsets;
+
+    using ElementK = typename BlockMmadKV::ElementA;
+    using ElementW = typename BlockMmadWH::ElementA;
+    using ElementU = typename BlockMmadKV::ElementB;
+    using ElementG = float;
+    using ElementH = typename BlockMmadWH::ElementB;
+    using ElementV = typename BlockMmadKV::ElementB;
+    using ElementVWork = half;
+    using ElementHWork = half;
+
+    using L1TileShape = typename BlockMmadWH::L1TileShape;
+    
+    using LayoutW = typename BlockMmadWH::LayoutA;
+    using LayoutH = typename BlockMmadWH::LayoutB;
+    using LayoutV = typename BlockMmadWH::LayoutC;
+    using LayoutK = typename BlockMmadKV::LayoutA;
+
+    
+    uint32_t batch;
+    uint32_t seqlen;
+    uint32_t kNumHead;
+    uint32_t vNumHead;
+    uint32_t kHeadDim;
+    uint32_t vHeadDim;
+    uint32_t chunkSize;
+    bool useInitialState;
+    bool storeFinalState;
+    uint32_t isVariedLen;
+    uint32_t shapeBatch;
+    uint32_t tokenBatch;
+    uint32_t vWorkspaceOffset;
+    uint32_t hWorkspaceOffset;
+    
+    AscendC::GlobalTensor<ElementK> gmK;
+    AscendC::GlobalTensor<ElementW> gmW;
+    AscendC::GlobalTensor<ElementU> gmU;
+    AscendC::GlobalTensor<ElementG> gmG;
+    AscendC::GlobalTensor<ElementH> gmInitialState;
+    AscendC::GlobalTensor<ElementH> gmH;
+    AscendC::GlobalTensor<ElementV> gmV;
+    AscendC::GlobalTensor<ElementH> gmFinalState;
+    AscendC::GlobalTensor<ElementV> gmVWorkspace;
+    AscendC::GlobalTensor<ElementVWork> gmVWorkspaceHalf;
+    AscendC::GlobalTensor<ElementH> gmHWorkspace;
+    AscendC::GlobalTensor<ElementHWork> gmHWorkspaceHalf;
+    
+    CubeScheduler cubeBlockScheduler;
+    VecScheduler vecBlockScheduler;
+
+    Arch::Resource<ArchTag> resource;
+
+
+    __aicore__ inline GDNFwdHKernel() {}
+
+    __aicore__ inline void Init(GM_ADDR k, GM_ADDR w, GM_ADDR u, GM_ADDR g, GM_ADDR inital_state, GM_ADDR cu_seqlens, GM_ADDR chunk_indices, 
+        GM_ADDR h, GM_ADDR v_new, GM_ADDR final_state, GM_ADDR tiling, GM_ADDR user) {
+        
+        __gm__ ChunkGatedDeltaRuleFwdHTilingData *__restrict gdnFwdHTilingData = reinterpret_cast<__gm__ ChunkGatedDeltaRuleFwdHTilingData *__restrict>(tiling);
+
+        batch = gdnFwdHTilingData->batch;
+        seqlen = gdnFwdHTilingData->seqlen;
+        kNumHead = gdnFwdHTilingData->kNumHead;
+        vNumHead = gdnFwdHTilingData->vNumHead;
+        kHeadDim = gdnFwdHTilingData->kHeadDim;
+        vHeadDim = gdnFwdHTilingData->vHeadDim;
+        chunkSize = gdnFwdHTilingData->chunkSize;
+        useInitialState = gdnFwdHTilingData->useInitialState;
+        storeFinalState = gdnFwdHTilingData->storeFinalState;
+        isVariedLen = gdnFwdHTilingData->isVariedLen;
+        shapeBatch = gdnFwdHTilingData->shapeBatch;
+        tokenBatch = gdnFwdHTilingData->tokenBatch;
+        vWorkspaceOffset = gdnFwdHTilingData->vWorkspaceOffset;
+        hWorkspaceOffset = gdnFwdHTilingData->hWorkspaceOffset;
+        
+        gmK.SetGlobalBuffer((__gm__ ElementK *)k);
+        gmW.SetGlobalBuffer((__gm__ ElementW *)w);
+        gmU.SetGlobalBuffer((__gm__ ElementU *)u);
+        gmG.SetGlobalBuffer((__gm__ ElementG *)g);
+        gmInitialState.SetGlobalBuffer((__gm__ ElementH *)inital_state);
+        gmH.SetGlobalBuffer((__gm__ ElementH *)h);
+        gmV.SetGlobalBuffer((__gm__ ElementV *)v_new);
+        gmFinalState.SetGlobalBuffer((__gm__ ElementH *)final_state);
+        gmVWorkspace.SetGlobalBuffer((__gm__ ElementV *)(user + vWorkspaceOffset));
+        gmVWorkspaceHalf.SetGlobalBuffer((__gm__ ElementVWork *)(user + vWorkspaceOffset));
+        gmHWorkspace.SetGlobalBuffer((__gm__ ElementH *)(user + hWorkspaceOffset));
+        gmHWorkspaceHalf.SetGlobalBuffer((__gm__ ElementHWork *)(user + hWorkspaceOffset));
+
+        if ASCEND_IS_AIC {
+            cubeBlockScheduler.Init(cu_seqlens, chunk_indices, tiling);
+        }
+
+        if ASCEND_IS_AIV {
+            vecBlockScheduler.Init(cu_seqlens, chunk_indices, tiling);
+        }
+    }
+    
+    __aicore__ inline void Process() {
+
+        if ASCEND_IS_AIC {
+            uint32_t coreIdx = AscendC::GetBlockIdx();
+            uint32_t coreNum = AscendC::GetBlockNum();
+
+            BlockMmadWH blockMmadWH(resource);
+            BlockMmadKV blockMmadKV(resource);
+
+            LayoutW wLayout {shapeBatch * kNumHead * cubeBlockScheduler.totalTokens, kHeadDim};  
+            LayoutH hLayout {shapeBatch * vNumHead * cubeBlockScheduler.totalChunks * kHeadDim, vHeadDim};
+            LayoutV vLayout {coreNum * chunkSize * PING_PONG_STAGES, vHeadDim}; 
+            
+            LayoutK kLayout {kHeadDim, shapeBatch * kNumHead * cubeBlockScheduler.totalTokens}; 
+            LayoutV vworkLayout {coreNum * chunkSize * PING_PONG_STAGES, vHeadDim}; 
+            LayoutH hworkLayout {coreNum * kHeadDim * PING_PONG_STAGES, vHeadDim};
+
+            bool needRun = false;
+
+            while (cubeBlockScheduler.isRunning) {
+                cubeBlockScheduler.InitTask();
+                // step 1: v_work = w @ h[i]
+                GDNFwdHOffsets& cube1Offsets = cubeBlockScheduler.GetCube1Offsets();
+                if (cube1Offsets.chunkIdx != 0) {
+                    Arch::CrossCoreWaitFlag(cubeBlockScheduler.vec2Done);
+                } else {
+                    Arch::CrossCoreWaitFlag(cubeBlockScheduler.vec1Done);
+                }
+                if (!cube1Offsets.isDummyHead) {
+                    int64_t cube1OffsetW = cube1Offsets.wOffset;
+                    int64_t cube1OffsetH = cube1Offsets.hSrcOffset;
+                    int64_t cube1OffsetVwork = cube1Offsets.vWorkOffset;
+                    GemmCoord cube1Shape{cube1Offsets.blockTokens, vHeadDim, kHeadDim};
+                    blockMmadWH.preSetFlags();
+                    blockMmadWH(
+                        gmW[cube1OffsetW], wLayout,
+                        gmH[cube1OffsetH], hLayout,
+                        gmVWorkspaceHalf[cube1OffsetVwork], vLayout,
+                        cube1Shape
+                    );
+                    blockMmadWH.finalWaitFlags();
+                }
+                Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(cubeBlockScheduler.cube1Done);
+
+                GDNFwdHOffsets& cube2Offsets = cubeBlockScheduler.GetCube2Offsets();
+                if (!cube2Offsets.isFinalState && needRun) {
+                    Arch::CrossCoreWaitFlag(cubeBlockScheduler.vec1Done);
+                    // step 3: h[i+1] = k.T @ v_work
+                    if (!cube2Offsets.isDummyHead) {
+                        int64_t cube2OffsetK = cube2Offsets.wkOffset;
+                        int64_t cube2OffsetVwork = cube2Offsets.vWorkOffset;
+                        int64_t cube2OffsetH = cube2Offsets.hWorkOffset;
+                        GemmCoord cube2Shape{kHeadDim, vHeadDim, cube2Offsets.blockTokens};
+                        blockMmadKV.preSetFlags();
+                        blockMmadKV(
+                            gmK[cube2OffsetK], kLayout,
+                            gmVWorkspace[cube2OffsetVwork],  vworkLayout,
+                            gmHWorkspaceHalf[cube2OffsetH],  hLayout,
+                            cube2Shape
+                        );
+                        blockMmadKV.finalWaitFlags();
+                    }
+                    Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(cubeBlockScheduler.cube2Done);
+                }
+                needRun = true;
+            }
+            Arch::CrossCoreWaitFlag(cubeBlockScheduler.vec1Done);
+            Arch::CrossCoreWaitFlag(cubeBlockScheduler.vec1Done);
+
+        }
+
+        if ASCEND_IS_AIV {
+            uint32_t coreIdx = AscendC::GetBlockIdx();
+            uint32_t coreNum = AscendC::GetBlockNum();
+            uint32_t subBlockIdx = AscendC::GetSubBlockIdx();
+            uint32_t subBlockNum = AscendC::GetSubBlockNum();
+
+            EpilogueGDNFwdHVnew epilogueGDNFwdHVnew(resource);
+            bool needRun = false;
+
+            Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(vecBlockScheduler.vec1Done);
+            Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(vecBlockScheduler.vec1Done);
+            while (vecBlockScheduler.isRunning) {
+                vecBlockScheduler.InitTask();
+                // step 2:
+                GDNFwdHOffsets& vec1Offsets = vecBlockScheduler.GetVec1Offsets();
+                // gmV = gmU - gmVWorkspace
+                // g_buf = gmG[-1] - gmG
+                // g_buf = exp(g_buf)
+                // gmVWorkspace = g_buf * gmV
+                if (!vec1Offsets.isDummyHead) {
+                    epilogueGDNFwdHVnew(
+                        gmV[vec1Offsets.uvOffset], gmVWorkspace[vec1Offsets.vWorkOffset], 
+                        gmG[vec1Offsets.gOffset], gmU[vec1Offsets.uvOffset], gmVWorkspaceHalf[vec1Offsets.vWorkOffset], 
+                        vec1Offsets.blockTokens, kHeadDim, vHeadDim, vecBlockScheduler.cube1Done
+                    );
+                } else {
+                    Arch::CrossCoreWaitFlag(vecBlockScheduler.cube1Done);
+                }
+                Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(vecBlockScheduler.vec1Done);
+
+                GDNFwdHOffsets& vec2Offsets = vecBlockScheduler.GetVec2Offsets();
+                if (!vec2Offsets.isFinalState && needRun) {
+                    // step 4:  h[i+1] += h_work if i < num_chunks - 1 else None
+                    if (!vec2Offsets.isDummyHead) {
+                        EpilogueGDNFwdHUpdate epilogueGDNFwdHUpdate(resource);
+                        epilogueGDNFwdHUpdate(
+                            gmH[vec2Offsets.hDstOffset],
+                            gmG[vec2Offsets.gOffset],
+                            gmH[vec2Offsets.hSrcOffset],
+                            gmHWorkspaceHalf[vec2Offsets.hWorkOffset],
+                            vec2Offsets.blockTokens, kHeadDim, vHeadDim, vecBlockScheduler.cube2Done
+                        );
+                    } else {
+                        Arch::CrossCoreWaitFlag(vecBlockScheduler.cube2Done);
+                    }
+                    Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(vecBlockScheduler.vec2Done);
+                }
+                needRun = true;
+            }
+
+        }
+    }
+
+};
+
+}
